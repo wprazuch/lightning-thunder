@@ -7,6 +7,7 @@ from contextlib import nullcontext
 
 import torch
 import functools
+import torch.nn as nn
 from torch.utils.data import DataLoader, IterableDataset
 import torch.distributed as torch_dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -26,7 +27,6 @@ from lightning.fabric.utilities import Throughput
 
 try:
     import transformer_engine.pytorch as te
-    from lightning.fabric.plugins.precision.transformer_engine import TransformerEnginePrecision
 
     transformer_engine_available = True
 except ImportError:
@@ -62,6 +62,39 @@ def check_fp8_compute_capability() -> None:
 
 def is_transformer_engine(low_precision_mode: str) -> bool:
     return low_precision_mode == "fp8-delayed-te"
+
+
+def swap_linear_layers_for_te(model: nn.Module) -> None:
+    
+    def parameters_cnt(model: nn.Module) -> int:
+        return sum(p.numel() for p in model.parameters())
+
+    def _resursively_swap_linear_layers_for_te(module: nn.Module) -> None:
+        for n, m in module.named_children():
+            if len(list(m.children())) > 0:
+                _resursively_swap_linear_layers_for_te(m)
+
+            if isinstance(m, nn.Linear):
+                bias_flag = m.bias is not None
+                new_linear = te.Linear(
+                    m.in_features, m.out_features, bias=bias_flag
+                )
+                setattr(module, n, new_linear)
+            
+            if isinstance(m, nn.LayerNorm):
+                new_layernorm = te.LayerNorm(
+                    m.normalized_shape[0], eps=m.eps
+                )
+                new_layernorm.weight.data = m.weight.data.clone()
+                new_layernorm.bias.data = m.bias.data.clone()
+                setattr(module, n, new_layernorm)
+
+    initial_params_cnt = parameters_cnt(model)
+    _resursively_swap_linear_layers_for_te(model)
+    assert initial_params_cnt == parameters_cnt(model)
+    for m in model.modules():
+        assert not isinstance(m, nn.Linear)
+    print(f"--> Now model has linear layers from transformer_engine!")
 
 
 def configure_optimizers(model, weight_decay, learning_rate, betas, device_type):
@@ -237,8 +270,8 @@ class Benchmark_litGPT:
         print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
 
         if self.use_te_fp8_autocast:
-            te_precision = TransformerEnginePrecision(weights_dtype=torch.bfloat16, replace_layers=True)
-            self.model = te_precision.convert_module(self.model)
+            swap_linear_layers_for_te(self.model)
+            self.model.to(torch.bfloat16)
 
         # Setup the distributed algorithm choices
         self.model = self.setup_distributed(self.model)
