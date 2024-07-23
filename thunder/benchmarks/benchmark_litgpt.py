@@ -79,6 +79,9 @@ def swap_linear_layers_for_te(model: nn.Module) -> None:
                 new_linear = te.Linear(
                     m.in_features, m.out_features, bias=bias_flag
                 )
+                new_linear.weight.data = m.weight.data.clone()
+                if bias_flag:
+                    new_linear.bias.data = m.bias.data.clone()
                 setattr(module, n, new_linear)
             
             if isinstance(m, nn.LayerNorm):
@@ -94,7 +97,7 @@ def swap_linear_layers_for_te(model: nn.Module) -> None:
     assert initial_params_cnt == parameters_cnt(model)
     for m in model.modules():
         assert not isinstance(m, nn.Linear)
-    print(f"--> Now model has linear layers from transformer_engine!")
+        assert not isinstance(m, nn.LayerNorm)
 
 
 def configure_optimizers(model, weight_decay, learning_rate, betas, device_type):
